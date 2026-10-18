@@ -7,6 +7,11 @@
 #include <tuple>
 #include <unordered_set>
 
+#ifdef _WIN32
+    #define NOMINMAX
+    #include <windows.h>
+#endif
+
 #include "core/ggml_extend_backend.h"
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
@@ -1843,12 +1848,39 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
             result.available_budget_bytes = std::min(result.available_budget_bytes, available);
         }
     }
-    LOG_VERBOSE("capacity check verdict on %s: required device %.2f MB / available %.2f MB, required budget %.2f MB / available %.2f MB, fits %s",
+#ifdef _WIN32
+    // Replicas staged for an offloaded model live in pinned/host-visible
+    // memory that the compute device's heap report does not see (#1976: the
+    // submit path failed with ErrorOutOfDeviceMemory while the device heap
+    // still reported 84% free and system availability had collapsed). The
+    // host dimension covers only what this request would pin (missing
+    // replicas) plus a safety margin for the driver; device-resident compute
+    // buffers stay on the device/budget dimensions. A host failure feeds the
+    // existing eviction path, which reclaims staged replicas.
+    if (missing > 0) {
+        MEMORYSTATUSEX status{};
+        status.dwLength    = sizeof(status);
+        result.required_host_bytes = missing;
+        if (GlobalMemoryStatusEx(&status)) {
+            // Measured on the #1976 machine (32 GB RAM, both resident models
+            // loaded): the driver fails to pin below ~0.5 GB available while
+            // the loaded-models baseline sits near 1.85 GB — 1 GiB centers
+            // the margin inside that window.
+            constexpr uint64_t host_safety_margin = 1ULL * 1024ULL * 1024ULL * 1024ULL;
+            result.available_host_bytes          = status.ullAvailPhys > host_safety_margin
+                                                       ? static_cast<size_t>(status.ullAvailPhys - host_safety_margin)
+                                                       : 0;
+        }
+    }
+#endif
+    LOG_VERBOSE("capacity check verdict on %s: required device %.2f MB / available %.2f MB, required budget %.2f MB / available %.2f MB, required host %.2f MB / available %.2f MB, fits %s",
                 ggml_backend_name(request.compute_backend),
                 result.required_device_bytes / (1024.0 * 1024.0),
                 result.available_device_bytes / (1024.0 * 1024.0),
                 result.required_budget_bytes / (1024.0 * 1024.0),
                 result.available_budget_bytes / (1024.0 * 1024.0),
+                result.required_host_bytes / (1024.0 * 1024.0),
+                result.available_host_bytes / (1024.0 * 1024.0),
                 result.fits() ? "yes" : "no");
     return result;
 }
